@@ -5,6 +5,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 import os
 import random
 from pathlib import Path
+import re
+import numpy as np
 
 # =========================
 # OPENAI CONFIG
@@ -24,20 +26,54 @@ if "recommendations" not in st.session_state:
     st.session_state.recommendations = None
 
 # =========================
+# INTENT EXTRACTION (BRAND + GEAR + CATEGORY)
+# =========================
+def extract_preferences(text):
+    text = text.lower()
+    prefs = {}
+
+    # -------- gearbox --------
+    if re.search(r"\bmanual\b|\bman\b|\bręczn|\bmanualna\b", text):
+        prefs["gear"] = "manual"
+    elif re.search(r"\bautomat\b|\bauto\b|\bautomatycz|\bautomatic\b", text):
+        prefs["gear"] = "automatic"
+
+    # -------- brands --------
+    brands = [
+        "bmw", "audi", "mercedes", "toyota", "honda", "ford",
+        "mazda", "volkswagen", "vw", "skoda", "seat", "hyundai",
+        "kia", "volvo", "lexus", "nissan", "peugeot", "renault",
+        "opel", "fiat", "jeep", "tesla"
+    ]
+    for b in brands:
+        if re.search(rf"\b{b}\b", text):
+            prefs["brand"] = b
+            break
+
+    # -------- category / segment --------
+    if re.search(r"\bsmall\b|\bcompact\b|\bcity\b|\bmiejski\b|\bmał", text):
+        prefs["category"] = ["Hatchback", "Crossover"]
+    elif re.search(r"\bsuv\b|\b4x4\b|\bcrossover\b|\bteren", text):
+        prefs["category"] = ["SUV", "Crossover"]
+    elif re.search(r"\bsedan\b|\blimousine\b|\blimuz", text):
+        prefs["category"] = ["Sedan"]
+    elif re.search(r"\bwagon\b|\bkombi\b|\bestate\b", text):
+        prefs["category"] = ["Wagon"]
+    elif re.search(r"\bcoupe\b|\bsport\b|\bsportowy\b", text):
+        prefs["category"] = ["Coupe"]
+    elif re.search(r"\bhatchback\b|\bhatch\b", text):
+        prefs["category"] = ["Hatchback"]
+
+    return prefs
+
+# =========================
 # DATA LOADING
 # =========================
 @st.cache_data
 def load_and_clean_data():
     df = pd.read_csv(r"C:\\Users\\sfran\\Desktop\\Pondel\\CARequester\\Car_Recomendation_System\\cars_new_final.csv").dropna()
 
-    text_columns = [
-        "product_name",
-        "category",
-        "gender",
-        "details",
-        "description"
-    ]
-
+    text_columns = ["product_name", "category", "gender", "gear", "description"]
     for col in text_columns:
         if col in df.columns:
             df[col] = df[col].astype(str)
@@ -60,10 +96,10 @@ def ensure_embeddings(df):
     if "embedding" not in df.columns:
         with st.spinner("Preparing recommendations (first time only)..."):
             combined_text = (
-                df["product_name"] + ". " +
-                df["category"] + ". " +
-                df["gender"] + " driver. " +
-                df["description"]
+                "Brand and model: " + df["product_name"] + ". " +
+                "Body type: " + df["category"] + ". " +
+                "Gearbox: " + df["gear"] + ". " +
+                "Description: " + df["description"]
             )
             df["embedding"] = combined_text.apply(get_embedding)
     return df
@@ -73,24 +109,22 @@ def ensure_embeddings(df):
 # =========================
 def generate_sales_description(row, user_query):
     prompt = f"""
-You are an experienced car salesman.
+You are a professional car salesman.
 
-Customer request:
+Customer is looking for:
 "{user_query}"
 
-Car information:
-Name: {row['product_name']}
+Car:
+{row['product_name']}
 Category: {row['category']}
-Target driver: {row['gender']}
+Gearbox: {row['gear']}
 Price: {row.get('price', 'N/A')}
-Base description: {row['description']}
-Technical details: {row['details']}
+Description: {row['description']}
 
-Write a persuasive, natural sales description.
-Focus on benefits, comfort and matching the customer needs.
-Do not list raw specs.
+Write a persuasive, friendly sales description.
+Focus on benefits and comfort.
+Do not list raw attributes.
 Do not mention AI.
-Tone: confident, friendly, professional.
 """
 
     response = client.chat.completions.create(
@@ -105,20 +139,37 @@ Tone: confident, friendly, professional.
     return response.choices[0].message.content
 
 # =========================
-# RECOMMENDER
+# RECOMMENDATION ENGINE (HYBRID + CATEGORY + BRAND + GEAR)
 # =========================
 def recommend_products(user_input, data):
+    prefs = extract_preferences(user_input)
+    filtered = data.copy()
+
+    # -------- hard filters --------
+    if "gear" in prefs:
+        filtered = filtered[filtered["gear"].str.lower().str.contains(prefs["gear"], na=False)]
+
+    if "brand" in prefs:
+        filtered = filtered[
+            filtered["product_name"].str.lower().str.contains(prefs["brand"], na=False)
+        ]
+
+    if "category" in prefs:
+        filtered = filtered[filtered["category"].isin(prefs["category"])]
+
+    # fallback jeśli wszystko wycięte
+    if len(filtered) == 0:
+        filtered = data.copy()
+
+    # -------- embeddings ranking --------
     user_embedding = get_embedding(user_input)
+    matrix = np.vstack(filtered["embedding"].values)
+    similarities = cosine_similarity([user_embedding], matrix)[0]
 
-    similarities = cosine_similarity(
-        [user_embedding],
-        data["embedding"].tolist()
-    )[0]
+    filtered = filtered.copy()
+    filtered["similarity"] = similarities
 
-    data = data.copy()
-    data["similarity"] = similarities
-
-    return data.sort_values("similarity", ascending=False).head(5)
+    return filtered.sort_values("similarity", ascending=False).head(5)
 
 # =========================
 # IMAGES
