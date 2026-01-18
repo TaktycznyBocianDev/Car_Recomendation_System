@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import openai
 from openai import OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
 import os
@@ -10,12 +9,13 @@ from pathlib import Path
 # =========================
 # OPENAI CONFIG
 # =========================
-APIKey = "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"
-openai.api_key = APIKey
-client = OpenAI(api_key=APIKey)
+client = OpenAI(api_key="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")
+
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
 
 # =========================
-# SESSION STATE INIT
+# SESSION STATE
 # =========================
 if "data" not in st.session_state:
     st.session_state.data = None
@@ -23,20 +23,21 @@ if "data" not in st.session_state:
 if "recommendations" not in st.session_state:
     st.session_state.recommendations = None
 
-if "similar_cars" not in st.session_state:
-    st.session_state.similar_cars = None
-
 # =========================
 # DATA LOADING
 # =========================
 @st.cache_data
 def load_and_clean_data():
-    df = pd.read_csv("cars_ready.csv").dropna()
+    df = pd.read_csv(r"C:\\Users\\sfran\\Desktop\\Pondel\\CARequester\\Car_Recomendation_System\\cars_new_final.csv").dropna()
 
-    if "MSRP" in df.columns:
-        df["MSRP"] = df["MSRP"].astype(int)
+    text_columns = [
+        "product_name",
+        "category",
+        "gender",
+        "details",
+        "description"
+    ]
 
-    text_columns = ["product_name", "category", "gender", "details", "description"]
     for col in text_columns:
         if col in df.columns:
             df[col] = df[col].astype(str)
@@ -44,73 +45,83 @@ def load_and_clean_data():
     df["gender"] = df["gender"].str.capitalize()
     return df.reset_index(drop=True)
 
+# =========================
+# EMBEDDINGS
+# =========================
 @st.cache_data
-def get_embedding(text, model="text-embedding-ada-002"):
+def get_embedding(text: str):
     text = text.replace("\n", " ")
     return client.embeddings.create(
-        input=[text],
-        model=model
+        model=EMBED_MODEL,
+        input=text
     ).data[0].embedding
 
-# =========================
-# LAZY EMBEDDINGS
-# =========================
 def ensure_embeddings(df):
     if "embedding" not in df.columns:
         with st.spinner("Preparing recommendations (first time only)..."):
-            combined_text = df["gender"] + " driver. " + df["description"]
+            combined_text = (
+                df["product_name"] + ". " +
+                df["category"] + ". " +
+                df["gender"] + " driver. " +
+                df["description"]
+            )
             df["embedding"] = combined_text.apply(get_embedding)
     return df
 
 # =========================
-# INITIALIZE DATA
+# SALES DESCRIPTION (LLM)
 # =========================
-if st.session_state.data is None:
-    st.session_state.data = load_and_clean_data()
+def generate_sales_description(row, user_query):
+    prompt = f"""
+You are an experienced car salesman.
 
-data = st.session_state.data
+Customer request:
+"{user_query}"
+
+Car information:
+Name: {row['product_name']}
+Category: {row['category']}
+Target driver: {row['gender']}
+Price: {row.get('price', 'N/A')}
+Base description: {row['description']}
+Technical details: {row['details']}
+
+Write a persuasive, natural sales description.
+Focus on benefits, comfort and matching the customer needs.
+Do not list raw specs.
+Do not mention AI.
+Tone: confident, friendly, professional.
+"""
+
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": "You sell cars."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
+
+    return response.choices[0].message.content
 
 # =========================
-# RECOMMENDER FUNCTIONS
+# RECOMMENDER
 # =========================
-def recommend_products(user_input, data, gender=None, category=None):
-
-    if gender:
-        user_input = f"{gender} driver looking for a car. " + user_input
-
+def recommend_products(user_input, data):
     user_embedding = get_embedding(user_input)
-    data_filtered = data.copy()
-
-    if category:
-        data_filtered = data_filtered[data_filtered["category"] == category]
 
     similarities = cosine_similarity(
         [user_embedding],
-        data_filtered["embedding"].tolist()
+        data["embedding"].tolist()
     )[0]
 
-    gender_bonus = (data_filtered["gender"] == gender).astype(int) * 0.05 if gender else 0
-    data_filtered["similarity"] = similarities + gender_bonus
+    data = data.copy()
+    data["similarity"] = similarities
 
-    return data_filtered.sort_values("similarity", ascending=False).head(5)
-
-def recommend_similar_cars(data, car_row, top_k=3):
-
-    data_filtered = data[data["product_name"] != car_row["product_name"]].copy()
-
-    similarities = cosine_similarity(
-        [car_row["embedding"]],
-        data_filtered["embedding"].tolist()
-    )[0]
-
-    gender_bonus = (data_filtered["gender"] == car_row["gender"]).astype(int) * 0.05
-    category_bonus = (data_filtered["category"] == car_row["category"]).astype(int) * 0.05
-
-    data_filtered["similarity"] = similarities + gender_bonus + category_bonus
-    return data_filtered.sort_values("similarity", ascending=False).head(top_k)
+    return data.sort_values("similarity", ascending=False).head(5)
 
 # =========================
-# IMAGE HANDLING
+# IMAGES
 # =========================
 def get_random_images(folder_path, n=3):
     if not folder_path:
@@ -125,54 +136,38 @@ def get_random_images(folder_path, n=3):
         if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
     ]
 
-    if not images:
-        return []
-
-    return random.sample(images, min(n, len(images)))
+    return random.sample(images, min(len(images), n))
 
 # =========================
 # STREAMLIT UI
 # =========================
-st.title("Car Recommendation System")
+if st.session_state.data is None:
+    st.session_state.data = load_and_clean_data()
+
+st.title("🚗 AI Car Recommendation System")
 
 user_input = st.text_input("Describe what kind of car you're looking for")
 
 if st.button("Recommend"):
-    data = ensure_embeddings(data)
+    data = ensure_embeddings(st.session_state.data)
     st.session_state.recommendations = recommend_products(user_input, data)
 
 # =========================
-# DISPLAY RECOMMENDATIONS
+# DISPLAY
 # =========================
 if st.session_state.recommendations is not None:
-    st.header("Recommended Cars")
+    st.header("🔥 Best Matches For You")
 
-    for idx, row in st.session_state.recommendations.iterrows():
+    for _, row in st.session_state.recommendations.iterrows():
         st.subheader(row["product_name"])
-        st.write(row["details"])
 
-        # ===== ZDJĘCIA =====
-        images = get_random_images(row.get("file_path"), n=3)
+        sales_text = generate_sales_description(row, user_input)
+        st.write(sales_text)
 
+        images = get_random_images(row.get("file_path"))
         if images:
-            cols = st.columns(3)
-            for i, img_path in enumerate(images):
-                with cols[i]:
-                    st.image(str(img_path), use_container_width=True)
+            cols = st.columns(len(images))
+            for col, img in zip(cols, images):
+                col.image(str(img), use_container_width=True)
 
-            st.caption("Zdjęcia mają charakter poglądowy")
-
-        # ===== SZCZEGÓŁY =====
-        if st.button(
-            "View details",
-            key=f"details_{row['product_name']}_{idx}"
-        ):
-            st.session_state.similar_cars = recommend_similar_cars(data, row)
-
-            st.header("Similar / Alternative Options")
-            cols = st.columns(3)
-
-            for j, (_, alt) in enumerate(st.session_state.similar_cars.iterrows()):
-                with cols[j % 3]:
-                    st.subheader(alt["product_name"])
-                    st.write(alt["details"])
+        st.caption("Images for illustrative purposes only")
